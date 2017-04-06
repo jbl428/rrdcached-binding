@@ -1,17 +1,19 @@
 'use strict';
-var RRDUtil = require('./util');
+//var RRDUtil = require('./util');
 var util = require('util');
 var net = require('net');
 
 if(typeof String.prototype.startsWith === 'undefined'){
 	String.prototype.startsWith = function(prefix) {
 		return this.indexOf(prefix) === 0;
-	}
-};
+	};
+}
 
+/*
 var escapeRegExp = function(str) {
     return str.replace(/([.*+?^=!:${}()|\[\]\/\\])/g, "\\$1");
-}
+};
+*/
 
 var RRDCache = function(){
 	var client = null;
@@ -30,9 +32,38 @@ RRDCache.connect = function(address, callback){
 	}
 	var options = (address.startsWith('unix:/') ? {path: address.substring(5)} : {host: address.substring(0,address.indexOf(':')), port: address.substring(address.indexOf(':') + 1)});
 	self.client = net.createConnection(options);
+	self.client.on('error', function(error) {
+		callback(error);
+	});
 	self.client.on('connect', function() {
 		this.setEncoding('ascii');
-		callback();
+		callback(null);
+	});
+
+	var status = null;
+	self.client.on('data', function (data){
+		if(!self.buffer){
+			self.buffer = "";
+		}
+		self.buffer += data;
+		if(status === null){
+			status = parseInt(self.buffer.substring(0, self.buffer.indexOf(' ')));
+		}
+		var receivedAll = status < 0 || ((self.buffer.match(/\n/g) || []).length === status + 1);
+
+		if(receivedAll){
+			console.log('receive all');
+			self.buffer = "";
+			status = null;
+			self.currentCallback(null, processData(data));
+			if (self.isBatch) return;
+			if(self.pendingWrites.length){
+				var pending = self.pendingWrites.pop();
+				doWrite(self, pending.command, pending.callback);
+			} else {
+				self.running = false;
+			}
+		}
 	});
 };
 
@@ -48,7 +79,9 @@ RRDCache.write = function(command, callback){
 var doWrite = function(self, command, callback){
 	self.running = true;
 		var status = null;
-		if(self.client != null && command != null){
+		if(self.client !== null && command !== null){
+			self.isBatch = command === 'BATCH' ? true : false;
+			self.currentCallback = callback;
 			command = command.trim();
 			// append newline to terminate command
 			if(command.substring(command.length - 1) != "\n"){
@@ -56,60 +89,53 @@ var doWrite = function(self, command, callback){
 			}
 			if(command === 'QUIT\n'){
 				self.client.end(command, 'ascii');
+				callback(null);
 				self.pendingWrites = Array();
 			} else {
 				self.client.write(command, 'ascii');
 			}
-			self.client.on('data', function bufferData (data){
-				if(!self.buffer){
-					self.buffer = "";
-				}
-				self.buffer += data;
-				if(status == null){
-					status = parseInt(self.buffer.substring(0, self.buffer.indexOf(' ')));
-				}
-				var receivedAll = status < 0 || ((self.buffer.match(/\n/g) || []).length == status + 1);
-				if(receivedAll){
-					self.buffer = "";
-					status = null;
-					self.client.removeListener('data', bufferData);
-					callback(null, processData(data));
-					if(self.pendingWrites.length){
-						var pending = self.pendingWrites.pop();
-						doWrite(self, pending.command, pending.callback);
-					} else {
-						self.running = false;
-					}
-				}
-			});
 		} else {
 			callback(new Error('Not Connected!'));
 		}
-}
+};
 
 var processData = function(data){
+	var info = Array();
 	var lines = data.split('\n');
 	var statusIdx = lines[0].indexOf(' ');
 	var status = parseInt(lines[0].substring(0, statusIdx));
-	var error = status < 0 ? true : false;
-	var info = Array();
-	if(error == false){
-		for(var i = 1; i < status; i++){
-			info.push(lines[i]);
+	var statusLine = lines[0].substring(statusIdx + 1);
+	var error = null;
+	if (statusLine.substring(0,5) === 'error') {
+		error = status > 0 ? true : false;
+		if(error === true){
+			for(var j = 1; j <= status; j++){
+				info.push(lines[j]);
+			}
+			status = -status;
+		}
+	} else {
+		error = status < 0 ? true : false;
+		if(error === false){
+			for(var i = 1; i < status; i++){
+				info.push(lines[i]);
+			}
 		}
 	}
 	RRDCache.lastReply = {
 		statuscode: status,
-		status: lines[0].substring(statusIdx + 1),
+		status: statusLine,
 		error: error,
 		info: info
 	};
 	return RRDCache.lastReply;
 };
 
+/*
 var replaceN = function(value){
-	return value.replace(new RegExp(escapeRegExp('N'), 'g'), parseInt(Date.now()/1000));
-}
+	return value.replace(/N/g, parseInt(Math.floor(Date.now()/1000)));
+};
+*/
 
 RRDCache.flush = function(filename, callback){
 	if(filename === undefined){
@@ -194,7 +220,7 @@ RRDCache.update = function(filename, values, callback){
 	} else {
 		newValues = values;
 	}
-	RRDCache.write(util.format("UPDATE %s %s", filename, replaceN(newValues)), callback);
+	RRDCache.write(util.format("UPDATE %s %s", filename, newValues), callback);
 };
 
 RRDCache.fetch = function(filename, consFunction, options, callback){
@@ -259,8 +285,7 @@ RRDCache.first = function(){
 		var callback = arguments.length == 3 ? arguments[2]: arguments[1];
 		RRDCache.write(util.format("FIRST %s %d", filename, rranum), callback);
 	} else {
-		callback(new Error("Invalid number of arguments!"));
-		return;
+		throw new Error('Invalid number of arguments!');
 	}
 };
 
@@ -293,13 +318,21 @@ RRDCache.create = function(filename, options, DSDefinitions, RRADefinitions, cal
 
 RRDCache.batch = function(commands, callback){
 	if(Array.isArray(commands)){
-		var command = "BATCH\n";
-		for(var c of commands){
-			command += c + "\n";
-		}
-		command += ".";
-		RRDCache.write(command, callback);
+		RRDCache.write('BATCH', function(err, reply) {
+			if (reply.statuscode === 0) {
+				var command = "";
+				for(var c of commands){
+					command += c + "\n";
+				}
+				command += ".";
+				doWrite(this, command, callback);
+				return;
+			}
+			callback(new Error('Batch command error'));
+		});
+		return;
 	}
+	callback(new Error('commands is not an array'));
 };
 
 RRDCache.quit = function(callback){
@@ -310,5 +343,5 @@ RRDCache.getLastReply = function(){
 	return this.lastReply;
 };
 
-RRDCache.util = RRDUtil;
+//RRDCache.util = RRDUtil;
 module.exports = RRDCache;
