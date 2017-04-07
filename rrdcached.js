@@ -51,12 +51,15 @@ RRDCache.connect = function(address, callback){
 		}
 		var receivedAll = status < 0 || ((self.buffer.match(/\n/g) || []).length === status + 1);
 
+
 		if(receivedAll){
-			console.log('receive all');
 			self.buffer = "";
 			status = null;
+			if (self.isBatch) {
+				self.currentCallback(null, processData(data));
+				return;
+			}
 			self.currentCallback(null, processData(data));
-			if (self.isBatch) return;
 			if(self.pendingWrites.length){
 				var pending = self.pendingWrites.pop();
 				doWrite(self, pending.command, pending.callback);
@@ -117,7 +120,7 @@ var processData = function(data){
 	} else {
 		error = status < 0 ? true : false;
 		if(error === false){
-			for(var i = 1; i < status; i++){
+			for(var i = 1; i <= status; i++){
 				info.push(lines[i]);
 			}
 		}
@@ -223,7 +226,7 @@ RRDCache.update = function(filename, values, callback){
 	RRDCache.write(util.format("UPDATE %s %s", filename, newValues), callback);
 };
 
-RRDCache.fetch = function(filename, consFunction, options, callback){
+RRDCache.fetch = function(filename, consFunction, start, end, callback){
 	if(filename === undefined){
 		callback(new Error("No filename specified!"));
 		return;
@@ -236,45 +239,96 @@ RRDCache.fetch = function(filename, consFunction, options, callback){
 		callback(new Error("Invalid consolidation function. Choose one of AVERAGE, MIN, MAX, LAST."));
 		return;
 	}
-	var resolution = options !== null && options.resolution !== undefined ? util.format("-r %s", options.resolution) : "";
-	var start = options !== null && options.start !== undefined ? util.format("-s %s", options.resolution) : "";
-	var end = options !== null && options.end !== undefined ? util.format("-e %s", options.end) : "";
-	var align = options !== null && (options.alignStart !== undefined && options.alignStart || options.a !== undefined && options.a) ? "-a" : "";
-	RRDCache.write(util.format("FETCH %s %s %s %s %s %s", filename, consFunction, resolution, start, end, align), function(err, reply){
+	RRDCache.write(util.format("FETCH %s %s %d %d", filename, consFunction, start, end), function(err, reply){
 		if(err){
 			callback(err);
 			return;
 		}
 		reply.fetch = {};
-		var columns = Array();
+		var dsName = null;
+		var data = Array();
 		for(var line of reply.info){
-			if(line.trim() === ""){
-				continue;
-			}
 			var split = line.split(": ");
-			if(split.length == 1){
-				for(var col of split[0].trim().split(" ")){
-					columns.push(col);
-				}
-			} else {
-				var insert = {};
-				insert.date = new Date(split[0] * 1000);
-				if(columns.length > 0){
-					insert.data = {};
-					var values = split[1].split(" ");
-					for(var i; i < values; i++){
-						insert.data[columns[i]] = values[i];
+			switch(split[0]) {
+				case 'Start':
+				case 'End' :
+					reply.fetch[split[0]] = split[1];
+					continue;
+				case 'DSName':
+					dsName = split[1].split(" ");
+					continue;
+			}
+
+			if (!/\D/.test(split[0])) {
+				var values = split[1].split(" ");
+				var tmp = {};
+				if (dsName !== null && values.length === dsName.length) {
+					for(var i = 0; i < values.length; i++){
+						if (values[i] === '-nan') {
+							tmp[dsName[i]] = NaN;
+						} else {
+							tmp[dsName[i]] = Number(values[i]);
+						}
 					}
-				} else {
-					insert.data = Array();
-					for(var value of split[1].split(" ")){
-						insert.data.push(value);
-					}
+					data.push({
+						time: split[0],
+						values: tmp
+					});
 				}
-				reply.fetch[split[0]] = insert;
 			}
 		}
+		reply.fetch.data = data;
 		callback(null, reply);
+	});
+};
+
+RRDCache.latest = function(filename, consFunction, callback){
+	RRDCache.write(util.format("FETCH %s %s %d %d", filename, consFunction, -120, -60), function(err, reply){
+		if(err){
+			callback(err);
+			return;
+		}
+		reply.latest = {};
+
+		var data = Array();
+		for (var i = 0; i < 3; i++) {
+			var line = reply.info.pop();
+			var split = line.split(": ");
+			if (/\D/.test(split[0]) && split[0] !== 'DSName') {
+				callback(new Error('Parse error'));
+				return;
+			}
+			data.push(split[1].split(' '));
+		}
+
+		/*
+		data[0] : latest
+		data[1] : 1 minute ago
+		data[2] : DS names
+		 */
+
+		if (data[0].length > 0 && data[0].length === data[1].length &&
+			data[0].length === data[2].length) {
+			var index = null;
+			if (!isNaN(data[0][0]))	 {
+				index = 0;
+			} else if (!isNaN(data[1][0])) {
+				index = 1;
+			}
+
+			if (index !== null) {
+				for (var j = 0; j < data[2].length; j++) {
+					reply.latest[data[2][j]] = Number(data[index][j]);
+				}
+			} else {
+				for (var k = 0; k < data[2].length; k++) {
+					reply.latest[data[2][k]] = NaN;
+				}
+			}
+			callback(null, reply);
+			return;
+		}
+		callback(new Error('Parse error'));
 	});
 };
 
@@ -318,6 +372,7 @@ RRDCache.create = function(filename, options, DSDefinitions, RRADefinitions, cal
 
 RRDCache.batch = function(commands, callback){
 	if(Array.isArray(commands)){
+		var self = this;
 		RRDCache.write('BATCH', function(err, reply) {
 			if (reply.statuscode === 0) {
 				var command = "";
@@ -325,8 +380,14 @@ RRDCache.batch = function(commands, callback){
 					command += c + "\n";
 				}
 				command += ".";
-				doWrite(this, command, callback);
+				doWrite(self, command, callback);
 				return;
+			}
+			if(self.pendingWrites.length){
+				var pending = self.pendingWrites.pop();
+				doWrite(self, pending.command, pending.callback);
+			} else {
+				self.running = false;
 			}
 			callback(new Error('Batch command error'));
 		});
