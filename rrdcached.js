@@ -240,8 +240,8 @@ RRDCache.fetch = function(filename, consFunction, start, end, callback){
 		return;
 	}
 	RRDCache.write(util.format("FETCH %s %s %d %d", filename, consFunction, start, end), function(err, reply){
-		if(err){
-			callback(err);
+		if(err || reply.error){
+			callback(err || reply.status);
 			return;
 		}
 		reply.fetch = {};
@@ -284,8 +284,8 @@ RRDCache.fetch = function(filename, consFunction, start, end, callback){
 
 RRDCache.latest = function(filename, consFunction, callback){
 	RRDCache.write(util.format("FETCH %s %s %d %d", filename, consFunction, -120, -60), function(err, reply){
-		if(err){
-			callback(err);
+		if(err || reply.error){
+			callback(err || reply.status);
 			return;
 		}
 		reply.latest = {};
