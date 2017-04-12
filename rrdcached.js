@@ -112,7 +112,8 @@ var processData = function(data){
 	if (statusLine.substring(0,5) === 'error') {
 		error = status > 0 ? true : false;
 		if(error === true){
-			for(var j = 1; j <= status; j++){
+			lines.pop();
+			for(var j = 1; j < lines.length; j++){
 				info.push(lines[j]);
 			}
 			status = -status;
@@ -120,7 +121,8 @@ var processData = function(data){
 	} else {
 		error = status < 0 ? true : false;
 		if(error === false){
-			for(var i = 1; i <= status; i++){
+			lines.pop();
+			for(var i = 1; i < lines.length; i++){
 				info.push(lines[i]);
 			}
 		}
